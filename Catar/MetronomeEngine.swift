@@ -21,7 +21,8 @@ final class MetronomeEngine: ObservableObject, @unchecked Sendable {
     private func setupAudio() {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, options: [])
+        // playAndRecord + mixWithOthers lets the metronome keep playing while recording
+        try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .mixWithOthers])
         try? session.setActive(true)
         #endif
 
@@ -62,18 +63,15 @@ final class MetronomeEngine: ObservableObject, @unchecked Sendable {
     }
 
     func setBPM(_ newBPM: Double) {
-        let clamped = max(40, min(240, newBPM))
-        bpm = clamped
-        if isPlaying {
-            stopEngine()
-            startEngine()
-        }
+        // Just update the value — the running timer reads bpm fresh each beat,
+        // so the new tempo takes effect at the next natural beat with no restart.
+        bpm = max(40, min(240, newBPM))
     }
 
     private func startEngine() {
         isPlaying = true
         beatCount = 0
-        scheduleTimer()
+        fireBeatAndReschedule()
     }
 
     private func stopEngine() {
@@ -83,23 +81,23 @@ final class MetronomeEngine: ObservableObject, @unchecked Sendable {
         currentBeat = -1
     }
 
-    private func scheduleTimer() {
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: timerQueue)
+    private func fireBeatAndReschedule() {
+        guard isPlaying else { return }
+
+        // Play the click for this beat
+        let beat = beatCount % 4
+        let buffer = beat == 0 ? accentBuffer : tickBuffer
+        if let buffer { playerNode.scheduleBuffer(buffer, completionHandler: nil) }
+
+        let capturedBeat = beat
+        DispatchQueue.main.async { [weak self] in self?.currentBeat = capturedBeat }
+        beatCount += 1
+
+        // Schedule next beat using bpm as it stands right now
         let intervalNs = Int(60_000_000_000.0 / bpm)
-        timer.schedule(deadline: .now(), repeating: .nanoseconds(intervalNs), leeway: .nanoseconds(0))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let beat = self.beatCount % 4
-            let buffer = beat == 0 ? self.accentBuffer : self.tickBuffer
-            if let buffer {
-                self.playerNode.scheduleBuffer(buffer, completionHandler: nil)
-            }
-            let capturedBeat = beat
-            DispatchQueue.main.async { [weak self] in
-                self?.currentBeat = capturedBeat
-            }
-            self.beatCount += 1
-        }
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: timerQueue)
+        timer.schedule(deadline: .now() + .nanoseconds(intervalNs), leeway: .nanoseconds(0))
+        timer.setEventHandler { [weak self] in self?.fireBeatAndReschedule() }
         timer.resume()
         metronomeTimer = timer
     }

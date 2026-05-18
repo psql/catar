@@ -3,13 +3,16 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 56;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		CAAA0000000000000000BB01 /* CatarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA01 /* CatarApp.swift */; };
 		CAAA0000000000000000BB02 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA02 /* ContentView.swift */; };
 		CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA03 /* MetronomeEngine.swift */; };
+		CAAA0000000000000000BB06 /* Recording.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA06 /* Recording.swift */; };
+		CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA07 /* RecordingEngine.swift */; };
+		CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA08 /* RecordingsListView.swift */; };
 		CAAA0000000000000000BB04 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA04 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -17,6 +20,9 @@
 		CAAA0000000000000000AA01 /* CatarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CatarApp.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA03 /* MetronomeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetronomeEngine.swift; sourceTree = "<group>"; };
+		CAAA0000000000000000AA06 /* Recording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recording.swift; sourceTree = "<group>"; };
+		CAAA0000000000000000AA07 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
+		CAAA0000000000000000AA08 /* RecordingsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsListView.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA04 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		CAAA0000000000000000AA05 /* Catar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Catar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -32,7 +38,7 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		CAAA0000000000000000DD01 /* = */ = {
+		CAAA0000000000000000DD01 = {
 			isa = PBXGroup;
 			children = (
 				CAAA0000000000000000DD02 /* Catar */,
@@ -46,6 +52,9 @@
 				CAAA0000000000000000AA01 /* CatarApp.swift */,
 				CAAA0000000000000000AA02 /* ContentView.swift */,
 				CAAA0000000000000000AA03 /* MetronomeEngine.swift */,
+				CAAA0000000000000000AA06 /* Recording.swift */,
+				CAAA0000000000000000AA07 /* RecordingEngine.swift */,
+				CAAA0000000000000000AA08 /* RecordingsListView.swift */,
 				CAAA0000000000000000AA04 /* Assets.xcassets */,
 			);
 			path = Catar;
@@ -131,6 +140,9 @@
 				CAAA0000000000000000BB01 /* CatarApp.swift in Sources */,
 				CAAA0000000000000000BB02 /* ContentView.swift in Sources */,
 				CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */,
+				CAAA0000000000000000BB06 /* Recording.swift in Sources */,
+				CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */,
+				CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -255,11 +267,13 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = HFYS9XNM5B;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Catar records audio while the metronome plays.";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
@@ -269,7 +283,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.altbizney.catar";
+				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.catar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -285,11 +299,13 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = HFYS9XNM5B;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Catar records audio while the metronome plays.";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
@@ -299,7 +315,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.altbizney.catar";
+				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.catar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
