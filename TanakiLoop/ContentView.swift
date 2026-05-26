@@ -56,12 +56,10 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
-            // Always-on circle visualizer (behind rings)
-            CircleFieldView(samples: engine.waveformSamples)
+            // Always-on spectrogram (behind rings)
+            SpectrogramView(bins: engine.fftMagnitudes, isRecording: engine.isRecording)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
-                .opacity(engine.isRecording ? 1.0 : 0.55)
-                .animation(.easeInOut(duration: 0.3), value: engine.isRecording)
 
             // Centered record + rings
             radialCenter
@@ -340,42 +338,33 @@ struct ContentView: View {
     }
 }
 
-// MARK: - CircleFieldView
+// MARK: - SpectrogramView
 
-struct CircleFieldView: View {
-    let samples: [Float]
-    private let count = 28
-
-    // Golden-angle spiral positions, normalised to [-1, 1]
-    private static let positions: [(CGFloat, CGFloat)] = {
-        let phi: CGFloat = 137.508 * .pi / 180
-        return (0..<28).map { i in
-            let angle: CGFloat = CGFloat(i) * phi
-            let r: CGFloat     = sqrt(CGFloat(i + 1) / 29) * 0.88
-            return (cos(angle) * r, sin(angle) * r)
-        }
-    }()
-
-    // Stable per-circle hue offsets so they all have their own personality
-    private static let hueOffsets: [Double] = (0..<28).map { _ in Double.random(in: 0...0.08) }
+struct SpectrogramView: View {
+    let bins:        [Float]
+    let isRecording: Bool
 
     var body: some View {
         GeometryReader { geo in
-            let cx   = geo.size.width  / 2
-            let cy   = geo.size.height / 2
-            let maxR = min(cx, cy) * 0.92
+            Canvas { ctx, size in
+                let count    = bins.count
+                let barW     = size.width / CGFloat(count)
+                let gap: CGFloat = 1.2
+                let maxH     = size.height * 0.60
+                let baseAlpha = isRecording ? 0.05 : 0.02
+                let scale     = isRecording ? 0.60 : 0.38
 
-            ForEach(0..<count, id: \.self) { i in
-                let idx = min(Int(Double(i) / Double(count) * Double(samples.count)),
-                              samples.count - 1)
-                let s   = Double(samples[idx])
-                let (px, py) = Self.positions[i]
-                let size = CGFloat(10 + s * 36)
-                Circle()
-                    .fill(Color.white.opacity(s * 0.55 + 0.08))
-                    .frame(width: size, height: size)
-                    .position(x: cx + px * maxR, y: cy + py * maxR)
-                    .animation(.spring(response: 0.40, dampingFraction: 0.78), value: s)
+                for i in 0..<count {
+                    let mag  = CGFloat(bins[i])
+                    let h    = pow(mag, 0.62) * maxH
+                    guard h > 0.5 else { continue }
+                    let x    = CGFloat(i) * barW + gap * 0.5
+                    let w    = max(1, barW - gap)
+                    let rect = CGRect(x: x, y: size.height - h, width: w, height: h)
+                    let alpha = Double(mag) * scale + baseAlpha
+                    ctx.fill(Path(roundedRect: rect, cornerRadius: 1.5),
+                             with: .color(.white.opacity(alpha)))
+                }
             }
         }
     }

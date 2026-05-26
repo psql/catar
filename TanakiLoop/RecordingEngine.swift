@@ -1,24 +1,24 @@
 import AVFoundation
+import Accelerate
 
 final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Published state
 
-    @Published private(set) var isPlaying:       Bool          = false
-    @Published private(set) var isRecording:     Bool          = false
-    @Published private(set) var isScrubbing:     Bool          = false
-    @Published private(set) var samples:         [Sample]      = []
-    @Published private(set) var waveformSamples: [Float]       = Array(repeating: 0, count: 60)
-    @Published private(set) var loopDuration:    TimeInterval? = nil
-    @Published private(set) var loopPosition:    Double        = 0   // 0–1
+    @Published private(set) var isPlaying:     Bool          = false
+    @Published private(set) var isRecording:   Bool          = false
+    @Published private(set) var isScrubbing:   Bool          = false
+    @Published private(set) var samples:       [Sample]      = []
+    @Published private(set) var fftMagnitudes: [Float]       = [Float](repeating: 0, count: 64)
+    @Published private(set) var loopDuration:  TimeInterval? = nil
+    @Published private(set) var loopPosition:  Double        = 0
 
     // MARK: - Audio engine
 
-    private let audioEngine       = AVAudioEngine()
-    private var playerNodes:       [UUID: AVAudioPlayerNode] = [:]
-    private var sampleBufs:        [UUID: AVAudioPCMBuffer]  = [:]
-    private var mixerTapInstalled  = false
-    private var lastTapUpdate:     Date = .distantPast
+    private let audioEngine  = AVAudioEngine()
+    private var playerNodes: [UUID: AVAudioPlayerNode] = [:]
+    private var sampleBufs:  [UUID: AVAudioPCMBuffer]  = [:]
+    private var inputTapInstalled = false
 
     // MARK: - Loop clock
 
@@ -26,21 +26,35 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private var loopStartDate:  Date?
     private var pausedPosition: Double = 0
 
+    // MARK: - Ring buffer (always-on mic capture, ~60 s at 48 kHz)
+
+    private let ringCapacity = 48_000 * 60
+    private var ringBuffer   = [Float](repeating: 0, count: 48_000 * 60)
+    private var ringWritePos: Int = 0      // audio thread writes; Int is word-atomic on arm64
+    private var captureStartPos: Int = 0
+    private var captureFormat:   AVAudioFormat?
+
+    // MARK: - FFT
+
+    private let fftN         = 1024
+    private let fftBinCount  = 64
+    private var fftSetup:    FFTSetup?
+    private var fftWindow    = [Float](repeating: 0, count: 1024)
+    private var fftInput     = [Float](repeating: 0, count: 1024)
+    private var fftSmooth    = [Float](repeating: 0, count: 64)
+    private var fftNextFire: Date = .distantPast
+
     // MARK: - Recording
 
-    private var audioRecorder:   AVAudioRecorder?
-    private var meterTimer:      Timer?
-    private var recordingURL:    URL?
-    private var recordingStart:  Date?
-    private var recordingPhase:  Double = 0
-    private var hasAnyLoop:      Bool   = false   // main-thread flag; set before background dispatch
+    private var recordingPhase: Double = 0
+    private var hasAnyLoop:     Bool   = false
 
     // MARK: - Scrub
 
-    private var wasPlayingBeforeScrub  = false
-    private var throwTimer:            Timer?
-    private var lastScrubChunkPos:     Double = -1
-    private var lastScrubChunkDate:    Date   = .distantPast
+    private var wasPlayingBeforeScrub = false
+    private var throwTimer:           Timer?
+    private var lastScrubChunkPos:    Double = -1
+    private var lastScrubChunkDate:   Date   = .distantPast
 
     // MARK: - Init
 
@@ -48,33 +62,24 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     init() {
         setupAudioSession()
-        prewarmRecorder()
+        fftSetup = vDSP_create_fftsetup(vDSP_Length(10), FFTRadix(kFFTRadix2))
+        vDSP_hann_window(&fftWindow, vDSP_Length(fftN), Int32(vDSP_HANN_DENORM))
         #if os(iOS)
+        AVAudioApplication.requestRecordPermission { _ in }   // warm up; instant no-op if already granted
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
-            object:  nil,
-            queue:   .main
+            object: nil, queue: .main
         ) { [weak self] _ in self?.updatePlaybackVolume() }
         #endif
     }
 
     deinit {
-        if mixerTapInstalled { audioEngine.mainMixerNode.removeTap(onBus: 0) }
+        if inputTapInstalled { audioEngine.inputNode.removeTap(onBus: 0) }
+        if let setup = fftSetup { vDSP_destroy_fftsetup(setup) }
         if let obs = routeObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
-    private func prewarmRecorder() {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("prewarm.m4a")
-        let settings: [String: Any] = [
-            AVFormatIDKey:            Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey:          44100,
-            AVNumberOfChannelsKey:    1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-        ]
-        let rec = try? AVAudioRecorder(url: url, settings: settings)
-        rec?.prepareToRecord()
-        try? FileManager.default.removeItem(at: url)
-    }
+    // MARK: - Audio session
 
     private func setupAudioSession() {
         #if os(iOS)
@@ -85,7 +90,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         #endif
     }
 
-    // MARK: - Headphone-aware volume ducking
+    // MARK: - Headphone-aware ducking
 
     private var headphonesConnected: Bool {
         #if os(iOS)
@@ -106,34 +111,104 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         audioEngine.mainMixerNode.outputVolume = vol
     }
 
+    // MARK: - Engine lifecycle
+
     private func startEngineIfNeeded() {
         guard !audioEngine.isRunning else { return }
         audioEngine.prepare()
         do {
             try audioEngine.start()
-            installMixerTap()
+            installInputTap()
         } catch { print("Engine error: \(error)") }
     }
 
-    private func installMixerTap() {
-        guard !mixerTapInstalled else { return }
-        let mixer = audioEngine.mainMixerNode
-        mixer.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
-            guard let self, !self.isRecording else { return }
+    private func installInputTap() {
+        guard !inputTapInstalled else { return }
+        let inputNode = audioEngine.inputNode
+        let hwFmt     = inputNode.outputFormat(forBus: 0)
+        captureFormat = AVAudioFormat(standardFormatWithSampleRate: hwFmt.sampleRate, channels: 1)
+
+        inputNode.installTap(onBus: 0, bufferSize: 512, format: hwFmt) { [weak self] buffer, _ in
+            guard let self, let ch = buffer.floatChannelData?[0] else { return }
+            let n   = Int(buffer.frameLength)
+            let cap = self.ringCapacity
+
+            // Write channel-0 samples into the ring buffer
+            for i in 0..<n {
+                self.ringBuffer[self.ringWritePos % cap] = ch[i]
+                self.ringWritePos += 1
+            }
+
+            // FFT at ~30 fps
             let now = Date()
-            guard now.timeIntervalSince(self.lastTapUpdate) > 1 / 30 else { return }
-            self.lastTapUpdate = now
-            guard let ch = buffer.floatChannelData?[0] else { return }
-            let n = Int(buffer.frameLength)
-            var sum: Float = 0
-            for i in 0..<n { sum += ch[i] * ch[i] }
-            let rms = sqrt(sum / Float(n))
-            let v   = Float(min(1.0, Double(rms) * 18))
-            var next = self.waveformSamples
-            next.removeFirst(); next.append(v)
-            DispatchQueue.main.async { self.waveformSamples = next }
+            guard now > self.fftNextFire else { return }
+            self.fftNextFire = now.addingTimeInterval(1.0 / 30.0)
+            self.computeFFT(samples: ch, count: n)
         }
-        mixerTapInstalled = true
+        inputTapInstalled = true
+    }
+
+    // MARK: - FFT
+
+    private func computeFFT(samples: UnsafePointer<Float>, count: Int) {
+        guard let setup = fftSetup else { return }
+        let n     = fftN
+        let halfN = n / 2
+
+        // Slide input window forward with new samples
+        fftInput.withUnsafeMutableBufferPointer { buf in
+            let p     = buf.baseAddress!
+            let shift = min(count, n)
+            let keep  = n - shift
+            if keep > 0 { memmove(p, p.advanced(by: shift), keep * MemoryLayout<Float>.size) }
+            memcpy(p.advanced(by: keep),
+                   samples.advanced(by: max(0, count - shift)),
+                   shift * MemoryLayout<Float>.size)
+        }
+
+        // Apply Hann window
+        var windowed = [Float](repeating: 0, count: n)
+        vDSP_vmul(fftInput, 1, fftWindow, 1, &windowed, 1, vDSP_Length(n))
+
+        // Real FFT via split-complex
+        var realp = [Float](repeating: 0, count: halfN)
+        var imagp = [Float](repeating: 0, count: halfN)
+        var mags  = [Float](repeating: 0, count: halfN)
+
+        windowed.withUnsafeBytes { rawBuf in
+            rawBuf.withMemoryRebound(to: DSPComplex.self) { cBuf in
+                realp.withUnsafeMutableBufferPointer { rp in
+                    imagp.withUnsafeMutableBufferPointer { ip in
+                        var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                        vDSP_ctoz(cBuf.baseAddress!, 2, &split, 1, vDSP_Length(halfN))
+                        vDSP_fft_zrip(setup, &split, 1, vDSP_Length(10), FFTDirection(FFT_FORWARD))
+                        vDSP_zvabs(&split, 1, &mags, 1, vDSP_Length(halfN))
+                    }
+                }
+            }
+        }
+
+        var scale = Float(2.0) / Float(n)
+        vDSP_vsmul(mags, 1, &scale, &mags, 1, vDSP_Length(halfN))
+
+        // Map to log-spaced display bins (~130 Hz – ~9 kHz)
+        let dispN  = fftBinCount
+        let minBin = 3
+        let maxBin = min(halfN - 2, 210)
+        var result = [Float](repeating: 0, count: dispN)
+
+        for i in 0..<dispN {
+            let t    = Double(i) / Double(dispN - 1)
+            let binF = Double(minBin) * pow(Double(maxBin) / Double(minBin), t)
+            let b0   = max(0, min(halfN - 2, Int(binF)))
+            let frac = Float(binF - Double(Int(binF)))
+            let mag  = mags[b0] * (1 - frac) + mags[b0 + 1] * frac
+            let db   = 20.0 * log10f(max(mag, 1e-8))
+            let norm = max(0, min(1, (db + 80.0) / 80.0))
+            result[i] = max(norm, fftSmooth[i] * 0.82)   // fast attack, slow decay
+        }
+        fftSmooth = result
+        DispatchQueue.main.async { self.fftMagnitudes = result }
     }
 
     // MARK: - Playback
@@ -181,8 +256,10 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private func startPositionTimer() {
         positionTimer?.invalidate()
         positionTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self, let dur = self.loopDuration, let start = self.loopStartDate, dur > 0 else { return }
-            self.loopPosition = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
+            guard let self, let dur = self.loopDuration,
+                  let start = self.loopStartDate, dur > 0 else { return }
+            self.loopPosition = Date().timeIntervalSince(start)
+                .truncatingRemainder(dividingBy: dur) / dur
         }
     }
 
@@ -227,16 +304,16 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     }
 
     private func finishScrub() {
-        isScrubbing        = false
+        isScrubbing       = false
         throwTimer?.invalidate(); throwTimer = nil
-        lastScrubChunkPos  = -1
-        let pos            = pausedPosition
+        lastScrubChunkPos = -1
+        let pos           = pausedPosition
 
         for sample in samples {
             guard let node = playerNodes[sample.id],
                   let buf  = sampleBufs[sample.id] else { continue }
             node.stop()
-            let distance   = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
+            let distance    = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
             let frameOffset = AVAudioFrameCount(distance * Double(buf.frameLength))
             let tailFrames  = buf.frameLength > frameOffset ? buf.frameLength - frameOffset : 0
             scheduleFromOffset(node: node, buf: buf, frameOffset: frameOffset, tailFrames: tailFrames)
@@ -260,17 +337,16 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         for sample in samples {
             guard let node = playerNodes[sample.id],
                   let buf  = sampleBufs[sample.id] else { continue }
-            let dist  = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let start = AVAudioFrameCount(dist * Double(buf.frameLength))
-            let cap   = AVAudioFrameCount(chunkSecs * buf.format.sampleRate)
-            let avail = buf.frameLength > start ? buf.frameLength - start : 0
+            let dist   = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
+            let start  = AVAudioFrameCount(dist * Double(buf.frameLength))
+            let cap    = AVAudioFrameCount(chunkSecs * buf.format.sampleRate)
+            let avail  = buf.frameLength > start ? buf.frameLength - start : 0
             let frames = min(cap, avail)
             guard frames > 100,
                   let chunk = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: frames),
                   let src = buf.floatChannelData, let dst = chunk.floatChannelData else { continue }
             chunk.frameLength = frames
-            let ch = Int(buf.format.channelCount)
-            for c in 0..<ch {
+            for c in 0..<Int(buf.format.channelCount) {
                 memcpy(dst[c], src[c].advanced(by: Int(start)),
                        Int(frames) * MemoryLayout<Float>.size)
             }
@@ -286,7 +362,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
         let newDur     = dur * 2
         let rawElapsed = currentRawElapsed(within: dur)
-
         let wasPlaying = isPlaying
         playerNodes.values.forEach { $0.stop() }
         isPlaying = false
@@ -299,14 +374,14 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             guard let newBuf = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: nFrames),
                   let src = buf.floatChannelData, let dst = newBuf.floatChannelData else { continue }
             newBuf.frameLength = nFrames
-            let ch = Int(buf.format.channelCount)
+            let ch         = Int(buf.format.channelCount)
             let frameBytes = Int(buf.frameLength) * MemoryLayout<Float>.size
             for c in 0..<ch {
                 memcpy(dst[c], src[c], frameBytes)
                 memcpy(dst[c].advanced(by: Int(buf.frameLength)), src[c], frameBytes)
             }
-            sampleBufs[id] = newBuf
-            let newPhase = samples[i].phaseOffset / 2.0
+            sampleBufs[id]         = newBuf
+            let newPhase           = samples[i].phaseOffset / 2.0
             samples[i].phaseOffset = newPhase
             samples[i].duration    = newDur
             let distance   = (rawElapsed / newDur - newPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
@@ -318,7 +393,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         loopDuration   = newDur
         loopStartDate  = Date().addingTimeInterval(-rawElapsed)
         pausedPosition = rawElapsed / newDur
-
         if wasPlaying {
             playerNodes.values.forEach { $0.play() }
             isPlaying = true
@@ -330,7 +404,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         guard let dur = loopDuration, dur > 0.4, !samples.isEmpty, !isRecording, !isScrubbing else { return }
         let newDur     = dur / 2
         let rawElapsed = currentRawElapsed(within: newDur)
-
         let wasPlaying = isPlaying
         playerNodes.values.forEach { $0.stop() }
         isPlaying = false
@@ -339,9 +412,9 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         for i in 0..<samples.count {
             let id = samples[i].id
             guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
-            buf.frameLength = buf.frameLength / 2
-            let nFrames     = buf.frameLength
-            let newPhase    = (samples[i].phaseOffset * 2.0).truncatingRemainder(dividingBy: 1.0)
+            buf.frameLength    = buf.frameLength / 2
+            let nFrames        = buf.frameLength
+            let newPhase       = (samples[i].phaseOffset * 2.0).truncatingRemainder(dividingBy: 1.0)
             samples[i].phaseOffset = newPhase
             samples[i].duration    = newDur
             let distance   = (rawElapsed / newDur - newPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
@@ -353,7 +426,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         loopDuration   = newDur
         loopStartDate  = Date().addingTimeInterval(-rawElapsed)
         pausedPosition = rawElapsed / newDur
-
         if wasPlaying {
             playerNodes.values.forEach { $0.play() }
             isPlaying = true
@@ -388,7 +460,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         node.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
     }
 
-    // MARK: - Undo
+    // MARK: - Undo / Clear
 
     func undo() {
         guard !samples.isEmpty else { return }
@@ -400,14 +472,12 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         if samples.isEmpty { loopDuration = nil; hasAnyLoop = false; stopLoop() }
     }
 
-    // MARK: - Clear
-
     func clearAll() {
         throwTimer?.invalidate(); throwTimer = nil
-        isScrubbing   = false
+        isScrubbing  = false
         stopLoop()
-        loopDuration  = nil
-        hasAnyLoop    = false
+        loopDuration = nil
+        hasAnyLoop   = false
         for node in playerNodes.values { node.stop(); audioEngine.detach(node) }
         playerNodes.removeAll(); sampleBufs.removeAll()
         samples.forEach { try? FileManager.default.removeItem(at: $0.url) }
@@ -418,85 +488,84 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     func startRecording() {
         guard !isRecording, !isScrubbing else { return }
-        AVAudioApplication.requestRecordPermission { _ in
-            DispatchQueue.main.async { self.beginCapture() }
+        #if os(iOS)
+        let perm = AVAudioSession.sharedInstance().recordPermission
+        if perm == .undetermined {
+            AVAudioApplication.requestRecordPermission { [weak self] granted in
+                if granted { DispatchQueue.main.async { self?.startRecording() } }
+            }
+            return
         }
-    }
+        guard perm == .granted else { return }
+        #endif
 
-    private func beginCapture() {
         if !isPlaying && !samples.isEmpty { resumePlayback() }
-
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let url = dir.appendingPathComponent("raw-\(Int(Date().timeIntervalSince1970)).m4a")
-        recordingURL = url
-        let settings: [String: Any] = [
-            AVFormatIDKey:            Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey:          44100,
-            AVNumberOfChannelsKey:    1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-        ]
-        guard let rec = try? AVAudioRecorder(url: url, settings: settings) else { return }
-        rec.isMeteringEnabled = true
-        rec.record()
-        audioRecorder  = rec
-        recordingStart = Date()
-        recordingPhase = loopPosition
-        isRecording    = true
+        startEngineIfNeeded()
+        captureStartPos = ringWritePos    // mark start position after engine is up
+        recordingPhase  = loopPosition
+        isRecording     = true
         updatePlaybackVolume()
-        startMeterTimer()
     }
 
     func stopRecording() {
         guard isRecording else { return }
-        meterTimer?.invalidate(); meterTimer = nil
-        audioRecorder?.stop(); audioRecorder = nil
+        let endPos = ringWritePos         // snapshot before any further audio arrives
         isRecording = false
         updatePlaybackVolume()
-        waveformSamples = Array(repeating: 0, count: 60)
 
-        guard let url = recordingURL, let start = recordingStart else { return }
-        recordingURL = nil; recordingStart = nil
-        guard Date().timeIntervalSince(start) > 0.05 else {
-            try? FileManager.default.removeItem(at: url); return
-        }
-
-        // Determine isFirst on the main thread before background dispatch
         let isFirst       = !hasAnyLoop
         if isFirst { hasAnyLoop = true }
         let capturedPhase = isFirst ? 0.0 : recordingPhase
+        let start         = captureStartPos
+
+        guard let buf = drainRingBuffer(from: start, to: endPos) else {
+            if isFirst { hasAnyLoop = false }
+            return
+        }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.processSample(rawURL: url, capturedPhase: capturedPhase, isFirst: isFirst)
+            self?.processSampleBuffer(buf, capturedPhase: capturedPhase, isFirst: isFirst)
         }
     }
 
-    // MARK: - Buffer helpers
+    private func drainRingBuffer(from startPos: Int, to endPos: Int) -> AVAudioPCMBuffer? {
+        guard let fmt = captureFormat else { return nil }
+        let count = endPos - startPos
+        guard count > Int(fmt.sampleRate * 0.05) else { return nil }   // discard < 50 ms
 
-    private func padBuffer(_ buf: AVAudioPCMBuffer, toDuration dur: TimeInterval) -> AVAudioPCMBuffer? {
-        let targetFrames = AVAudioFrameCount(dur * buf.format.sampleRate)
-        guard targetFrames > buf.frameLength,
-              let padded = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: targetFrames),
-              let src    = buf.floatChannelData,
-              let dst    = padded.floatChannelData
-        else { return buf }
-        padded.frameLength = targetFrames
-        let channels  = Int(buf.format.channelCount)
-        let srcFrames = Int(buf.frameLength)
-        let dstFrames = Int(targetFrames)
-        for c in 0..<channels {
-            memcpy(dst[c], src[c], srcFrames * MemoryLayout<Float>.size)
-            memset(dst[c].advanced(by: srcFrames), 0, (dstFrames - srcFrames) * MemoryLayout<Float>.size)
+        let safeCount = min(count, ringCapacity)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt,
+                                          frameCapacity: AVAudioFrameCount(safeCount)),
+              let dst  = buf.floatChannelData?[0]
+        else { return nil }
+        buf.frameLength = AVAudioFrameCount(safeCount)
+
+        ringBuffer.withUnsafeBufferPointer { rb in
+            let ptr  = rb.baseAddress!
+            let si   = startPos % ringCapacity
+            let wrap = ringCapacity - si
+            if safeCount <= wrap {
+                memcpy(dst, ptr.advanced(by: si), safeCount * MemoryLayout<Float>.size)
+            } else {
+                memcpy(dst,                    ptr.advanced(by: si), wrap                  * MemoryLayout<Float>.size)
+                memcpy(dst.advanced(by: wrap), ptr,                  (safeCount - wrap)    * MemoryLayout<Float>.size)
+            }
         }
-        return padded
+        return buf
     }
 
-    // MARK: - Sample processing
+    // MARK: - Sample processing (in-memory, no file read)
 
-    private func processSample(rawURL: URL, capturedPhase: Double, isFirst: Bool) {
-        let url    = Sample.trimSilence(inputURL: rawURL) ?? rawURL
-        guard let buf = Sample.loadBuffer(url: url) else { return }
+    private func processSampleBuffer(_ rawBuf: AVAudioPCMBuffer, capturedPhase: Double, isFirst: Bool) {
+        let buf    = trimEndSilence(rawBuf) ?? rawBuf
         let rawDur = Double(buf.frameLength) / buf.format.sampleRate
-        let phaseOffset = capturedPhase
+
+        // Write CAF for cleanup reference (undo/clear); not on the critical path
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url = dir.appendingPathComponent("s-\(UUID().uuidString.prefix(8)).caf")
+        if let f = try? AVAudioFile(forWriting: url, settings: buf.format.settings) {
+            try? f.write(from: buf)
+        }
 
         var finalBuf = buf
         var finalDur = rawDur
@@ -512,7 +581,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             }
         }
 
-        let sample = Sample(url: url, duration: finalDur, naturalDuration: rawDur, phaseOffset: phaseOffset)
+        let sample = Sample(url: url, duration: finalDur, naturalDuration: rawDur, phaseOffset: capturedPhase)
         let node   = AVAudioPlayerNode()
         audioEngine.attach(node)
         audioEngine.connect(node, to: audioEngine.mainMixerNode, format: finalBuf.format)
@@ -520,7 +589,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-
             if isFirst {
                 self.loopDuration   = finalDur
                 self.loopStartDate  = Date()
@@ -531,7 +599,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             self.sampleBufs[sample.id]  = finalBuf
             self.samples.append(sample)
 
-            // Compute where in the sample's content the loop is right now
             let currentPos: Double
             if let start = self.loopStartDate, let dur = self.loopDuration, dur > 0 {
                 currentPos = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
@@ -539,7 +606,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
                 currentPos = self.pausedPosition
             }
 
-            let distance    = (currentPos - phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
+            let distance    = (currentPos - capturedPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
             let totalFrames = finalBuf.frameLength
             let frameOffset = AVAudioFrameCount(distance * Double(totalFrames))
             let tailFrames  = totalFrames > frameOffset ? totalFrames - frameOffset : 0
@@ -551,13 +618,45 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func startMeterTimer() {
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            guard let self, let rec = self.audioRecorder, rec.isRecording else { return }
-            rec.updateMeters()
-            let v = Float(max(0, min(1, (Double(rec.averagePower(forChannel: 0)) + 60) / 60)))
-            var next = self.waveformSamples; next.removeFirst(); next.append(v)
-            DispatchQueue.main.async { self.waveformSamples = next }
+    private func trimEndSilence(_ buf: AVAudioPCMBuffer, threshold: Float = 0.003) -> AVAudioPCMBuffer? {
+        guard let srcCh = buf.floatChannelData else { return nil }
+        let total   = Int(buf.frameLength)
+        let postPad = Int(buf.format.sampleRate * 0.06)
+        let ch0     = srcCh[0]
+
+        var endFrame = total
+        for i in stride(from: total - 1, through: 0, by: -1) {
+            if abs(ch0[i]) > threshold { endFrame = min(total, i + postPad); break }
         }
+        guard endFrame < total, endFrame > 0 else { return buf }
+
+        let channels = Int(buf.format.channelCount)
+        guard let out = AVAudioPCMBuffer(pcmFormat: buf.format,
+                                          frameCapacity: AVAudioFrameCount(endFrame)),
+              let dstCh = out.floatChannelData else { return buf }
+        out.frameLength = AVAudioFrameCount(endFrame)
+        for c in 0..<channels {
+            memcpy(dstCh[c], srcCh[c], endFrame * MemoryLayout<Float>.size)
+        }
+        return out
+    }
+
+    private func padBuffer(_ buf: AVAudioPCMBuffer, toDuration dur: TimeInterval) -> AVAudioPCMBuffer? {
+        let targetFrames = AVAudioFrameCount(dur * buf.format.sampleRate)
+        guard targetFrames > buf.frameLength,
+              let padded = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: targetFrames),
+              let src    = buf.floatChannelData,
+              let dst    = padded.floatChannelData
+        else { return buf }
+        padded.frameLength = targetFrames
+        let channels  = Int(buf.format.channelCount)
+        let srcFrames = Int(buf.frameLength)
+        let dstFrames = Int(targetFrames)
+        for c in 0..<channels {
+            memcpy(dst[c], src[c], srcFrames * MemoryLayout<Float>.size)
+            memset(dst[c].advanced(by: srcFrames), 0,
+                   (dstFrames - srcFrames) * MemoryLayout<Float>.size)
+        }
+        return padded
     }
 }
