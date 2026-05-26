@@ -58,25 +58,31 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Init
 
-    private var routeObserver: NSObjectProtocol?
+    private var routeObserver:  NSObjectProtocol?
+    private var engineObserver: NSObjectProtocol?
 
     init() {
         setupAudioSession()
         fftSetup = vDSP_create_fftsetup(vDSP_Length(10), FFTRadix(kFFTRadix2))
         vDSP_hann_window(&fftWindow, vDSP_Length(fftN), Int32(vDSP_HANN_DENORM))
         #if os(iOS)
-        AVAudioApplication.requestRecordPermission { _ in }   // warm up; instant no-op if already granted
+        AVAudioApplication.requestRecordPermission { _ in }
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: nil, queue: .main
-        ) { [weak self] _ in self?.updatePlaybackVolume() }
+        ) { [weak self] note in self?.handleRouteChange(note) }
+        engineObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine, queue: .main
+        ) { [weak self] _ in self?.handleEngineConfigChange() }
         #endif
     }
 
     deinit {
         if inputTapInstalled { audioEngine.inputNode.removeTap(onBus: 0) }
         if let setup = fftSetup { vDSP_destroy_fftsetup(setup) }
-        if let obs = routeObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = routeObserver  { NotificationCenter.default.removeObserver(obs) }
+        if let obs = engineObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
     // MARK: - Audio session
@@ -84,22 +90,26 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private func setupAudioSession() {
         #if os(iOS)
         let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playAndRecord, mode: .default,
-                           options: [.defaultToSpeaker, .mixWithOthers])
+        // .defaultToSpeaker is only safe when no external output device is present.
+        // USB audio interfaces route through their own headphone jack; forcing the
+        // built-in speaker would bypass the interface entirely.
+        var opts: AVAudioSession.CategoryOptions = [.mixWithOthers]
+        if !externalOutputConnected { opts.insert(.defaultToSpeaker) }
+        try? s.setCategory(.playAndRecord, mode: .default, options: opts)
         try? s.setActive(true)
         #endif
     }
 
-    // MARK: - Headphone-aware ducking
-
-    private var headphonesConnected: Bool {
+    // True when any external audio output (wired, BT, or USB interface) is active.
+    private var externalOutputConnected: Bool {
         #if os(iOS)
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
         return outputs.contains {
             $0.portType == .headphones    ||
             $0.portType == .bluetoothA2DP ||
             $0.portType == .bluetoothHFP  ||
-            $0.portType == .bluetoothLE
+            $0.portType == .bluetoothLE   ||
+            $0.portType == .usbAudio
         }
         #else
         return true
@@ -107,8 +117,36 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     }
 
     private func updatePlaybackVolume() {
-        let vol: Float = (isRecording && !headphonesConnected) ? 0.25 : 1.0
+        let vol: Float = (isRecording && !externalOutputConnected) ? 0.25 : 1.0
         audioEngine.mainMixerNode.outputVolume = vol
+    }
+
+    // Re-apply session options and re-install the input tap whenever the hardware
+    // route changes (USB interface plugged in or removed).
+    private func handleRouteChange(_ notification: Notification) {
+        setupAudioSession()
+        updatePlaybackVolume()
+        // Reset the tap — the new device likely has a different format/channel count.
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+            if audioEngine.isRunning { installInputTap() }
+        }
+    }
+
+    // AVAudioEngine posts this when hardware configuration changes and stops the engine.
+    // Reconnect all player nodes (their graph connections are invalidated) and restart.
+    private func handleEngineConfigChange() {
+        for (id, node) in playerNodes {
+            guard let buf = sampleBufs[id] else { continue }
+            audioEngine.attach(node)
+            audioEngine.connect(node, to: audioEngine.mainMixerNode, format: buf.format)
+        }
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        if isPlaying || isRecording { startEngineIfNeeded() }
     }
 
     // MARK: - Engine lifecycle
@@ -129,21 +167,34 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         captureFormat = AVAudioFormat(standardFormatWithSampleRate: hwFmt.sampleRate, channels: 1)
 
         inputNode.installTap(onBus: 0, bufferSize: 512, format: hwFmt) { [weak self] buffer, _ in
-            guard let self, let ch = buffer.floatChannelData?[0] else { return }
-            let n   = Int(buffer.frameLength)
-            let cap = self.ringCapacity
+            guard let self, let chData = buffer.floatChannelData else { return }
+            let n          = Int(buffer.frameLength)
+            let cap        = self.ringCapacity
+            let chCount    = Int(buffer.format.channelCount)
+            let ch0        = chData[0]
+            // Mix all input channels to mono (handles 1-mic phone, 2-mic USB interface, etc.)
+            let ch1        = chCount > 1 ? chData[1] : nil
 
-            // Write channel-0 samples into the ring buffer
             for i in 0..<n {
-                self.ringBuffer[self.ringWritePos % cap] = ch[i]
+                let s = ch1 != nil ? (ch0[i] + ch1![i]) * 0.5 : ch0[i]
+                self.ringBuffer[self.ringWritePos % cap] = s
                 self.ringWritePos += 1
             }
 
-            // FFT at ~30 fps
+            // FFT at ~30 fps using the mixed mono signal
             let now = Date()
             guard now > self.fftNextFire else { return }
             self.fftNextFire = now.addingTimeInterval(1.0 / 30.0)
-            self.computeFFT(samples: ch, count: n)
+            // Build a short mono mix array for FFT (avoids mutating ch0 in place)
+            if ch1 != nil {
+                var mixed = [Float](repeating: 0, count: n)
+                mixed.withUnsafeMutableBufferPointer { buf in
+                    for i in 0..<n { buf[i] = (ch0[i] + ch1![i]) * 0.5 }
+                }
+                mixed.withUnsafeBufferPointer { self.computeFFT(samples: $0.baseAddress!, count: n) }
+            } else {
+                self.computeFFT(samples: ch0, count: n)
+            }
         }
         inputTapInstalled = true
     }
